@@ -695,6 +695,8 @@ mod rewards_decode_tests {
 /// Firehose transaction payload passed to [`Handler`] callbacks.
 #[derive(Debug, Clone)]
 pub struct TransactionData {
+    /// Unix timestamp for the block that contains the transaction.
+    pub blocktime: u64,
     /// Slot that contains the transaction.
     pub slot: u64,
     /// Index of the transaction within the slot.
@@ -1413,6 +1415,7 @@ where
                                         on_tx_cb(
                                             thread_index,
                                             TransactionData {
+                                                blocktime: block.meta.blocktime,
                                                 slot: block.slot,
                                                 transaction_slot_index: tx.index.unwrap() as usize,
                                                 signature: *signature,
