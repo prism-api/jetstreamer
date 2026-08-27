@@ -58,6 +58,11 @@
 //!   cores, or leave it unset to size the pool automatically using CPU and network heuristics.
 //! - `JETSTREAMER_SEQUENTIAL` (default `false`): when truthy, firehose uses a single worker
 //!   thread and uses ripget's parallel windowed downloader for sequential reads.
+//! - `JETSTREAMER_ORDERED` (default `false`): when truthy, firehose uses `JETSTREAMER_THREADS`
+//!   workers on small consecutive slot chunks and emits chunk start/complete events so a plugin
+//!   can write in global slot order. Disables sequential ripget and work-stealing. Ignored when
+//!   reverse mode is on.
+//! - `JETSTREAMER_CHUNK_SIZE` (default `128`): slots per chunk in ordered mode.
 //! - `JETSTREAMER_REVERSE` (default `false`): when truthy, processes epochs in the slot range
 //!   from highest to lowest. Implies `JETSTREAMER_SEQUENTIAL`.
 //! - `JETSTREAMER_BUFFER_WINDOW` (default lower of 4 GiB and 15% of available RAM): ripget
@@ -96,6 +101,8 @@
 //! | `JETSTREAMER_CLICKHOUSE_MODE` | `auto` | Controls ClickHouse integration. `auto` enables output and spawns the helper only for local DSNs, `remote` enables output without spawning the helper, `local` always requests the helper, and `off` disables ClickHouse entirely. |
 //! | `JETSTREAMER_THREADS` | `auto` | Number of firehose ingestion threads. Leave unset to rely on hardware-based sizing or override with an explicit value when you know the ideal concurrency. |
 //! | `JETSTREAMER_SEQUENTIAL` | `false` | Enables single-thread firehose processing with ripget-backed sequential streaming. |
+//! | `JETSTREAMER_ORDERED` | `false` | Enables N-worker consecutive-chunk decode with sequenced plugin emit. |
+//! | `JETSTREAMER_CHUNK_SIZE` | `128` | Slots per chunk when `JETSTREAMER_ORDERED` is enabled. |
 //! | `JETSTREAMER_REVERSE` | `false` | Streams epochs from highest to lowest. Implies `JETSTREAMER_SEQUENTIAL`. |
 //! | `JETSTREAMER_BUFFER_WINDOW` | `min(4 GiB, 15% available RAM)` | Total ripget hot/cold window size used only when `JETSTREAMER_SEQUENTIAL` is enabled. |
 //!
@@ -348,6 +355,8 @@ impl Default for JetstreamerRunner {
                 threads: jetstreamer_firehose::system::optimal_firehose_thread_count(),
                 sequential: false,
                 reverse: false,
+                ordered: false,
+                chunk_size: None,
                 buffer_window_bytes: None,
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
@@ -398,6 +407,22 @@ impl JetstreamerRunner {
     /// the ripget parallel range count for sequential windowed downloads.
     pub const fn with_sequential(mut self, sequential: bool) -> Self {
         self.config.sequential = sequential;
+        self
+    }
+
+    /// Toggles ordered-parallel firehose mode.
+    ///
+    /// When enabled, firehose keeps `JETSTREAMER_THREADS` decode workers, splits the slot
+    /// range into consecutive chunks, and fires chunk start/complete events so a plugin can
+    /// emit in global slot order. Sequential ripget and work-stealing are disabled.
+    pub const fn with_ordered(mut self, ordered: bool) -> Self {
+        self.config.ordered = ordered;
+        self
+    }
+
+    /// Sets the ordered-mode chunk size in slots. `None` uses the firehose default (128).
+    pub const fn with_chunk_size(mut self, chunk_size: Option<u64>) -> Self {
+        self.config.chunk_size = chunk_size;
         self
     }
 
@@ -477,6 +502,8 @@ impl JetstreamerRunner {
         let threads = std::cmp::max(1, self.config.threads);
         let sequential = self.config.sequential;
         let reverse = self.config.reverse;
+        let ordered = self.config.ordered;
+        let chunk_size = self.config.chunk_size;
         let buffer_window_bytes = self.config.buffer_window_bytes;
         let clickhouse_enabled =
             self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
@@ -488,13 +515,15 @@ impl JetstreamerRunner {
         let worker_threads =
             std::cmp::max(1, threads.saturating_mul(WORKER_THREAD_MULTIPLIER)) + AUX_WORKER_THREADS;
         log::info!(
-            "processing slots [{}..{}) with {} configured threads on {} tokio workers (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
+            "processing slots [{}..{}) with {} configured threads on {} tokio workers (sequential={}, reverse={}, ordered={}, chunk_size={:?}, buffer_window_bytes={:?}, clickhouse_enabled={})",
             slot_range.start,
             slot_range.end,
             threads,
             worker_threads,
             sequential,
             reverse,
+            ordered,
+            chunk_size,
             buffer_window_bytes,
             clickhouse_enabled
         );
@@ -507,6 +536,8 @@ impl JetstreamerRunner {
             buffer_window_bytes,
         );
         runner.set_tui(tui_enabled);
+        runner.set_ordered(ordered);
+        runner.set_chunk_size(chunk_size);
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }
@@ -636,6 +667,11 @@ pub struct Config {
     pub sequential: bool,
     /// When `true` (sequential mode only), iterate epochs from highest to lowest.
     pub reverse: bool,
+    /// When `true`, decode consecutive slot chunks on `threads` workers and emit chunk events
+    /// so a plugin can write in global slot order.
+    pub ordered: bool,
+    /// Ordered-mode chunk size in slots. `None` uses the firehose default (128).
+    pub chunk_size: Option<u64>,
     /// Optional override for ripget sequential window size in bytes.
     pub buffer_window_bytes: Option<u64>,
     /// The range of slots to process, inclusive of the start and exclusive of the end slot.
@@ -706,6 +742,8 @@ impl BuiltinPlugin {
 ///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
 /// - `JETSTREAMER_SEQUENTIAL`: Enables single-thread sequential firehose mode when truthy.
+/// - `JETSTREAMER_ORDERED`: Enables N-worker consecutive-chunk ordered mode when truthy.
+/// - `JETSTREAMER_CHUNK_SIZE`: Slots per chunk in ordered mode (default 128).
 /// - `JETSTREAMER_REVERSE`: Enables reverse epoch iteration when truthy. Implies sequential mode.
 /// - `JETSTREAMER_BUFFER_WINDOW`: Optional ripget sequential window size (for example `4GiB`).
 ///
@@ -715,6 +753,8 @@ impl BuiltinPlugin {
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
 /// - `--list-plugins`: Returns [`CliInvocation::ListPlugins`].
 /// - `--sequential`: Enables single-thread sequential firehose mode.
+/// - `--ordered`: Enables N-worker consecutive-chunk ordered-parallel mode.
+/// - `--chunk-size <n>`: Slots per chunk in ordered mode.
 /// - `--reverse`: Streams epochs from highest to lowest. Implies `--sequential`.
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
 /// - `--clickhouse-dsn <url>`: Overrides the ClickHouse DSN (takes precedence over the
@@ -745,6 +785,8 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     let mut builtin_plugins = Vec::new();
     let mut no_plugins = false;
     let mut sequential_cli = false;
+    let mut ordered_cli = false;
+    let mut chunk_size_cli: Option<u64> = None;
     let mut reverse_cli = false;
     let mut buffer_window_cli: Option<String> = None;
     let mut clickhouse_dsn_cli: Option<String> = None;
@@ -773,6 +815,18 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
             }
             "--sequential" => {
                 sequential_cli = true;
+            }
+            "--ordered" => {
+                ordered_cli = true;
+            }
+            "--chunk-size" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--chunk-size requires a slot count".to_string())?;
+                let parsed = raw.parse::<u64>().map_err(|_| {
+                    format!("invalid --chunk-size '{raw}'; expected a positive integer")
+                })?;
+                chunk_size_cli = Some(parsed);
             }
             "--reverse" => {
                 reverse_cli = true;
@@ -804,7 +858,12 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     // paths can print an accurate resume command. Value-taking flags are skipped as pairs so
     // a flag value that happens to equal the positional cannot be mistaken for it.
     {
-        const VALUE_FLAGS: [&str; 3] = ["--with-plugin", "--buffer-window", "--clickhouse-dsn"];
+        const VALUE_FLAGS: [&str; 4] = [
+            "--with-plugin",
+            "--buffer-window",
+            "--clickhouse-dsn",
+            "--chunk-size",
+        ];
         let raw: Vec<String> = std::env::args().collect();
         let mut parts: Vec<String> = Vec::with_capacity(raw.len());
         let mut index = 0;
@@ -876,6 +935,22 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         parse_env_bool("JETSTREAMER_REVERSE", false)
     };
     let sequential = reverse || sequential_cli || parse_env_bool("JETSTREAMER_SEQUENTIAL", false);
+    let ordered = ordered_cli || parse_env_bool("JETSTREAMER_ORDERED", false);
+    let chunk_size = if let Some(cli) = chunk_size_cli {
+        Some(cli)
+    } else {
+        std::env::var("JETSTREAMER_CHUNK_SIZE")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>().map_err(|_| {
+                    format!(
+                        "invalid JETSTREAMER_CHUNK_SIZE '{}'; expected a positive integer",
+                        raw
+                    )
+                })
+            })
+            .transpose()?
+    };
     let buffer_window_raw = if let Some(cli) = buffer_window_cli {
         Some(cli)
     } else {
@@ -897,6 +972,8 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         threads,
         sequential,
         reverse,
+        ordered,
+        chunk_size,
         buffer_window_bytes,
         slot_range,
         clickhouse_enabled,

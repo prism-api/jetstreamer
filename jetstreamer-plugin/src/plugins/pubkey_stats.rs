@@ -300,6 +300,8 @@ mod tests {
             ..LegacyMessage::default()
         };
         TransactionData {
+            block_time: None,
+            chunk_seq: 0,
             slot,
             transaction_slot_index: 0,
             signature: Default::default(),
