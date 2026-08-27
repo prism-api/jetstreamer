@@ -49,7 +49,7 @@ impl Block {
             entries: vec![],
             meta: SlotMeta {
                 parent_slot: 0,
-                blocktime: 0,
+                blocktime: None,
                 block_height: None,
             },
             rewards: Cid::try_from(
@@ -171,7 +171,7 @@ mod block_tests {
             ],
             meta: SlotMeta {
                 parent_slot: 1,
-                blocktime: 1,
+                blocktime: Some(1),
                 block_height: Some(1),
             },
             rewards: Cid::try_from(
@@ -1187,8 +1187,8 @@ mod shredding_tests {
 pub struct SlotMeta {
     /// Parent slot that produced this block.
     pub parent_slot: u64,
-    /// Unix timestamp reported for the block.
-    pub blocktime: u64,
+    /// Optional Unix timestamp reported for the block.
+    pub blocktime: Option<u64>,
     /// Optional block height.
     pub block_height: Option<u64>,
 }
@@ -1198,7 +1198,7 @@ impl SlotMeta {
     pub fn from_cbor(val: serde_cbor::Value) -> SlotMeta {
         let mut slot_meta = SlotMeta {
             parent_slot: 0,
-            blocktime: 0,
+            blocktime: None,
             block_height: None,
         };
 
@@ -1209,7 +1209,7 @@ impl SlotMeta {
                 slot_meta.parent_slot = *parent_slot as u64;
             }
             if let Some(serde_cbor::Value::Integer(blocktime)) = array.get(1) {
-                slot_meta.blocktime = *blocktime as u64;
+                slot_meta.blocktime = Some(*blocktime as u64);
             }
             if let Some(serde_cbor::Value::Integer(block_height)) = array.get(2) {
                 slot_meta.block_height = Some(*block_height as u64);
@@ -1225,10 +1225,14 @@ impl SlotMeta {
             "parent_slot".to_string(),
             serde_json::Value::from(self.parent_slot),
         );
-        map.insert(
-            "blocktime".to_string(),
-            serde_json::Value::from(self.blocktime),
-        );
+        if self.blocktime.is_none() {
+            map.insert("blocktime".to_string(), serde_json::Value::Null);
+        } else {
+            map.insert(
+                "blocktime".to_string(),
+                serde_json::Value::from(self.blocktime),
+            );
+        }
         if self.block_height.is_none() {
             map.insert("block_height".to_string(), serde_json::Value::Null);
         } else {
@@ -1250,7 +1254,7 @@ mod slot_meta_tests {
     fn test_slot_meta() {
         let slot_meta = SlotMeta {
             parent_slot: 1,
-            blocktime: 1,
+            blocktime: Some(1),
             block_height: Some(1),
         };
         let json = slot_meta.to_json();

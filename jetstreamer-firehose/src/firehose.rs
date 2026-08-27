@@ -1170,6 +1170,11 @@ mod rewards_decode_tests {
 /// Firehose transaction payload passed to [`Handler`] callbacks.
 #[derive(Debug, Clone)]
 pub struct TransactionData {
+    /// Optional Unix timestamp for the block that contains the transaction.
+    pub block_time: Option<i64>,
+    /// Ordered-mode chunk index this transaction was decoded in. `0` when ordered
+    /// mode is off (a single implicit chunk covering the whole range).
+    pub chunk_seq: u64,
     /// Slot that contains the transaction.
     pub slot: u64,
     /// Index of the transaction within the slot.
@@ -1208,6 +1213,31 @@ pub struct RewardsData {
     pub slot: u64,
     /// Reward recipients and their associated reward information.
     pub rewards: Vec<(Address, RewardInfo)>,
+}
+
+/// Lifecycle event for one ordered-mode slot chunk.
+///
+/// Workers decode consecutive chunks in parallel. [`ChunkEvent::Start`] is fired before a
+/// worker seeks into the archive so a downstream sequencer can apply backpressure.
+/// [`ChunkEvent::Complete`] is fired after the chunk's slots are fully decoded (including
+/// empty / all-skipped chunks) so the sequencer can emit frames in `seq` order.
+#[derive(Debug, Clone)]
+pub enum ChunkEvent {
+    /// Worker is about to decode `slot_range`. `seq` is the 0-based chunk index.
+    Start {
+        /// 0-based index in the consecutive chunk list.
+        seq: u64,
+        /// Half-open slot window assigned to this chunk.
+        slot_range: Range<u64>,
+    },
+    /// Worker finished decoding `slot_range`. Downstream should treat the chunk as ready
+    /// to emit once every lower `seq` has also completed.
+    Complete {
+        /// 0-based index in the consecutive chunk list.
+        seq: u64,
+        /// Half-open slot window assigned to this chunk.
+        slot_range: Range<u64>,
+    },
 }
 
 /// Block-level data streamed to block handlers.
@@ -1293,6 +1323,8 @@ pub type OnRewardFn = HandlerFn<RewardsData>;
 pub type StatsTracker = StatsTracking<HandlerFn<Stats>>;
 /// Convenience alias for firehose error handlers.
 pub type OnErrorFn = HandlerFn<FirehoseErrorContext>;
+/// Convenience alias for ordered-mode chunk lifecycle handlers.
+pub type OnChunkFn = HandlerFn<ChunkEvent>;
 /// Convenience alias for stats tracking handlers accepted by [`firehose`].
 pub type OnStatsTrackingFn = StatsTracking<HandlerFn<Stats>>;
 
@@ -1324,6 +1356,11 @@ pub struct FirehoseErrorContext {
 /// When `reverse` is `true` (sequential mode only), epochs in the requested range are
 /// processed from highest to lowest. Within each epoch slots are still emitted in ascending
 /// order because the underlying CAR archive can only be streamed forward.
+///
+/// When `ordered` is `true` (see [`firehose_ex`]), the range is split into small consecutive
+/// chunks decoded by `threads` workers in parallel. Work-stealing is disabled. A
+/// [`ChunkEvent`] handler can sequence downstream writes so the output is monotonic in slot
+/// order. Ordered mode is incompatible with reverse mode; reverse wins if both are set.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
@@ -1348,6 +1385,64 @@ where
     OnStats: Handler<Stats>,
     OnError: Handler<FirehoseErrorContext>,
 {
+    firehose_ex(
+        threads,
+        sequential,
+        reverse,
+        false,
+        None,
+        buffer_window_bytes,
+        slot_range,
+        on_block,
+        on_tx,
+        on_entry,
+        on_rewards,
+        on_error,
+        None::<OnChunkFn>,
+        stats_tracking,
+        shutdown_signal,
+    )
+    .await
+}
+
+/// Ordered-parallel variant of [`firehose`].
+///
+/// When `ordered` is `true`, `threads` firehose workers pull consecutive slot chunks of
+/// size `chunk_size` (default [`DEFAULT_ORDERED_CHUNK_SIZE`]) from a shared queue. Each
+/// worker seeks and decodes independently (same path as non-sequential mode). `on_chunk`
+/// receives [`ChunkEvent::Start`] before decode and [`ChunkEvent::Complete`] after, so a
+/// plugin can buffer per-chunk and emit in `seq` order.
+///
+/// Sequential ripget is disabled in ordered mode: each chunk seeks into the CAR rather than
+/// streaming an epoch from the start. Reverse mode takes precedence over ordered mode.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub async fn firehose_ex<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError, OnChunk>(
+    threads: u64,
+    sequential: bool,
+    reverse: bool,
+    ordered: bool,
+    chunk_size: Option<u64>,
+    buffer_window_bytes: Option<u64>,
+    slot_range: Range<u64>,
+    on_block: Option<OnBlock>,
+    on_tx: Option<OnTransaction>,
+    on_entry: Option<OnEntry>,
+    on_rewards: Option<OnRewards>,
+    on_error: Option<OnError>,
+    on_chunk: Option<OnChunk>,
+    stats_tracking: Option<StatsTracking<OnStats>>,
+    shutdown_signal: Option<broadcast::Receiver<()>>,
+) -> Result<(), (FirehoseError, u64)>
+where
+    OnBlock: Handler<BlockData>,
+    OnTransaction: Handler<TransactionData>,
+    OnEntry: Handler<EntryData>,
+    OnRewards: Handler<RewardsData>,
+    OnStats: Handler<Stats>,
+    OnError: Handler<FirehoseErrorContext>,
+    OnChunk: Handler<ChunkEvent>,
+{
     if threads == 0 {
         return Err((
             FirehoseError::OnLoadError("Number of threads must be greater than 0".into()),
@@ -1358,8 +1453,30 @@ where
     log::info!(target: LOG_MODULE, "starting firehose...");
     log::info!(target: LOG_MODULE, "index base url: {}", SLOT_OFFSET_INDEX.base_url());
     // Reverse mode implies sequential mode; activate it automatically when caller passed
-    // `reverse: true` without `sequential: true`.
-    let sequential = sequential || reverse;
+    // `reverse: true` without `sequential: true`. Ordered mode is the opposite of sequential:
+    // N seek-workers on consecutive chunks. Reverse takes precedence if both are requested.
+    let reverse_mode = reverse;
+    let ordered = if ordered && reverse_mode {
+        log::warn!(
+            target: LOG_MODULE,
+            "ordered mode ignored because reverse mode is active"
+        );
+        false
+    } else {
+        ordered
+    };
+    if ordered && sequential {
+        log::warn!(
+            target: LOG_MODULE,
+            "ordered mode uses {} parallel seek workers; sequential ripget disabled",
+            threads
+        );
+    }
+    let sequential = if ordered {
+        false
+    } else {
+        sequential || reverse
+    };
     let firehose_threads = if sequential { 1 } else { threads };
     let sequential_download_threads = std::cmp::max(1, threads as usize);
     let sequential_buffer_window_bytes = buffer_window_bytes
@@ -1373,7 +1490,6 @@ where
             crate::system::format_byte_size(sequential_buffer_window_bytes)
         );
     }
-    let reverse_mode = reverse;
     if reverse_mode {
         log::info!(
             target: LOG_MODULE,
@@ -1382,10 +1498,32 @@ where
     }
 
     let slot_range = Arc::new(slot_range);
+    let ordered_chunk_size = chunk_size
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ORDERED_CHUNK_SIZE);
+    let ordered_chunks: Arc<Vec<Range<u64>>> = if ordered {
+        let chunks = generate_chunks(&slot_range, ordered_chunk_size);
+        log::info!(
+            target: LOG_MODULE,
+            "ordered mode enabled: {} chunks of {} slots, {} decode workers (work-stealing off)",
+            chunks.len(),
+            ordered_chunk_size,
+            firehose_threads
+        );
+        Arc::new(chunks)
+    } else {
+        Arc::new(Vec::new())
+    };
+    let next_chunk_index = Arc::new(AtomicU64::new(0));
 
-    // divide slot_range into n subranges
-    let subranges = generate_subranges(&slot_range, firehose_threads);
-    if firehose_threads > 1 {
+    // divide slot_range into n subranges. Ordered mode spawns `firehose_threads` long-lived
+    // workers that pull consecutive chunks; placeholder ranges are replaced before decode.
+    let subranges = if ordered {
+        (0..firehose_threads).map(|_| 0..1).collect::<Vec<_>>()
+    } else {
+        generate_subranges(&slot_range, firehose_threads)
+    };
+    if firehose_threads > 1 && !ordered {
         log::debug!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
@@ -1467,12 +1605,12 @@ where
     // This turns any silent slot loss (whatever the cause) into a loud, precise error.
     let coverage_log: Arc<std::sync::Mutex<Vec<(u64, u64)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    let overall_start = subranges.first().map(|range| range.start).unwrap_or(0);
-    let overall_end = subranges.last().map(|range| range.end).unwrap_or(0);
+    let overall_start = slot_range.start;
+    let overall_end = slot_range.end;
     let steal_lock = Arc::new(tokio::sync::Mutex::new(()));
     // Always on in threaded forward mode; sequential/reverse runs and single-thread runs
     // have nothing to steal.
-    let work_stealing = !sequential && !reverse_mode && thread_total > 1;
+    let work_stealing = !sequential && !reverse_mode && !ordered && thread_total > 1;
     if work_stealing {
         log::info!(
             target: LOG_MODULE,
@@ -1591,6 +1729,10 @@ where
         let ripget_threads = sequential_download_threads;
         let ripget_buffer_window_bytes = sequential_buffer_window_bytes;
         let ripget_client = shared_ripget_client.clone();
+        let ordered_mode = ordered;
+        let ordered_chunks = ordered_chunks.clone();
+        let next_chunk_index = next_chunk_index.clone();
+        let on_chunk = on_chunk.clone();
 
         let handle = tokio::spawn(async move {
             let transactions_since_stats = transactions_since_stats_cloned;
@@ -1647,8 +1789,48 @@ where
             };
 
             let mut retry_backoff = RetryBackoff::new();
-            // let mut triggered = false;
-            while let Err((err, slot)) = async {
+            let mut chunk_seq = 0u64;
+            'assignments: loop {
+                if ordered_mode {
+                    let idx = next_chunk_index.fetch_add(1, Ordering::Relaxed);
+                    if idx >= ordered_chunks.len() as u64 {
+                        break;
+                    }
+                    slot_range = ordered_chunks[idx as usize].clone();
+                    chunk_seq = idx;
+                    skip_until_index = None;
+                    last_counted_slot = slot_range.start.saturating_sub(1);
+                    last_emitted_slot_global = last_counted_slot;
+                    reverse_partial_resume = None;
+                    reverse_highest_remaining_epoch = None;
+                    retry_backoff = RetryBackoff::new();
+                    if let Some(ref mut stats) = thread_stats {
+                        stats.slot_range = slot_range.clone();
+                        stats.initial_slot_range = slot_range.clone();
+                        stats.current_slot = slot_range.start;
+                        stats.finish_time = None;
+                    }
+                    if let Some(on_chunk_cb) = on_chunk.as_ref()
+                        && let Err(err) = on_chunk_cb(
+                            thread_index,
+                            ChunkEvent::Start {
+                                seq: chunk_seq,
+                                slot_range: slot_range.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        log::error!(
+                            target: &log_target,
+                            "on_chunk start handler failed: {}",
+                            err
+                        );
+                        shutdown_flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                // let mut triggered = false;
+                while let Err((err, slot)) = async {
                 let mut last_emitted_slot = last_emitted_slot_global;
                 let op_timeout = if sequential_mode {
                     OP_TIMEOUT_SEQUENTIAL
@@ -2075,6 +2257,13 @@ where
                                         on_tx_cb(
                                             thread_index,
                                             TransactionData {
+                                                block_time: block
+                                                    .meta
+                                                    .blocktime
+                                                    .and_then(|blocktime| {
+                                                        i64::try_from(blocktime).ok()
+                                                    }),
+                                                chunk_seq,
                                                 slot: block.slot,
                                                 transaction_slot_index: tx.index.unwrap() as usize,
                                                 signature: *signature,
@@ -2257,7 +2446,12 @@ where
                                                             keyed_rewards,
                                                             num_partitions,
                                                         },
-                                                        block_time: Some(block.meta.blocktime as i64),
+                                                        block_time: block
+                                                            .meta
+                                                            .blocktime
+                                                            .and_then(|blocktime| {
+                                                                i64::try_from(blocktime).ok()
+                                                            }),
                                                         block_height: block.meta.block_height,
                                                         executed_transaction_count:
                                                             this_block_executed_transaction_count,
@@ -2492,7 +2686,17 @@ where
                     if block_enabled {
                         pending_skipped_slots.remove(&thread_index);
                     }
-                    log::info!(target: &log_target, "thread {} has finished its work", thread_index);
+                    if !ordered_mode {
+                        log::info!(target: &log_target, "thread {} has finished its work", thread_index);
+                    } else {
+                        log::debug!(
+                            target: &log_target,
+                            "thread {} finished chunk {} ({:?})",
+                            thread_index,
+                            chunk_seq,
+                            slot_range
+                        );
+                    }
                     }
                     Err((FirehoseError::RangeComplete, slot_range.end))
             }
@@ -2504,7 +2708,7 @@ where
                         "shutdown requested; terminating firehose thread {}",
                         thread_index
                     );
-                    break;
+                    break 'assignments;
                 }
                 // Range completion arrives through the retry loop so the thread can adopt
                 // stolen work (restarting the loop with a new range) or retire.
@@ -2520,6 +2724,27 @@ where
                             .lock()
                             .unwrap()
                             .push((assignment_start, last_counted_slot.saturating_add(1)));
+                    }
+                    if ordered_mode {
+                        if let Some(on_chunk_cb) = on_chunk.as_ref()
+                            && let Err(err) = on_chunk_cb(
+                                thread_index,
+                                ChunkEvent::Complete {
+                                    seq: chunk_seq,
+                                    slot_range: slot_range.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            log::error!(
+                                target: &log_target,
+                                "on_chunk complete handler failed: {}",
+                                err
+                            );
+                            shutdown_flag.store(true, Ordering::SeqCst);
+                            break 'assignments;
+                        }
+                        break;
                     }
                     // This thread is done with its own range: publish "nothing remaining" so
                     // hunters stop targeting it, then drain any pending steal proposals with
@@ -2570,7 +2795,7 @@ where
                         continue;
                     }
                     thread_activity::note_finished(thread_index);
-                    break;
+                    break 'assignments;
                 }
                 // A deliberate connection recycle is a clean restart, not a failure: skip the
                 // error logging, error counter, on_error callback, and retry backoff.
@@ -2704,8 +2929,15 @@ where
                             "shutdown requested; terminating firehose thread {}",
                             thread_index
                         );
-                        break;
+                        break 'assignments;
                     }
+                }
+            }
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if !ordered_mode {
+                    break;
                 }
             }
         });
@@ -3278,7 +3510,10 @@ async fn firehose_geyser_thread(
                                         keyed_rewards,
                                         num_partitions,
                                     },
-                                    Some(block.meta.blocktime as i64),
+                                    block
+                                        .meta
+                                        .blocktime
+                                        .and_then(|blocktime| i64::try_from(blocktime).ok()),
                                     block.meta.block_height,
                                     this_block_executed_transaction_count,
                                     this_block_entry_count,
@@ -3505,6 +3740,84 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
         total_covered
     );
     ranges
+}
+
+/// Default slots per chunk in ordered-parallel mode.
+///
+/// Sized for a high-RAM host (~512 GiB): 128 slots × 64 in-flight chunks is ~8k slots
+/// buffered, typically well under a 64 GiB encoded-frame cap, leaving the rest of RAM for
+/// OS page cache of CAR archives.
+pub const DEFAULT_ORDERED_CHUNK_SIZE: u64 = 128;
+
+/// Consecutive half-open slot chunks covering `slot_range`.
+///
+/// Unlike [`generate_subranges`], which splits the full range into `threads` giant pieces,
+/// this yields many small adjacent windows (`start..start+chunk_size`, then the next, …)
+/// so N workers can decode in parallel while a sequencer still emits in global slot order.
+pub fn generate_chunks(slot_range: &Range<u64>, chunk_size: u64) -> Vec<Range<u64>> {
+    let chunk_size = chunk_size.max(1);
+    if slot_range.end <= slot_range.start {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = slot_range.start;
+    while start < slot_range.end {
+        let end = start.saturating_add(chunk_size).min(slot_range.end);
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod generate_chunks_tests {
+    use super::*;
+
+    #[test]
+    fn splits_exact_multiples_into_equal_chunks() {
+        let chunks = generate_chunks(&(1000..1128), 32);
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0], 1000..1032);
+        assert_eq!(chunks[1], 1032..1064);
+        assert_eq!(chunks[2], 1064..1096);
+        assert_eq!(chunks[3], 1096..1128);
+    }
+
+    #[test]
+    fn last_chunk_holds_the_remainder() {
+        let chunks = generate_chunks(&(0..100), 32);
+        assert_eq!(chunks, vec![0..32, 32..64, 64..96, 96..100]);
+    }
+
+    #[test]
+    fn chunk_larger_than_range_yields_one_chunk() {
+        assert_eq!(generate_chunks(&(5..15), 128), vec![5..15]);
+    }
+
+    #[test]
+    fn empty_range_yields_no_chunks() {
+        assert!(generate_chunks(&(10..10), 32).is_empty());
+        assert!(generate_chunks(&(20..10), 32).is_empty());
+    }
+
+    #[test]
+    fn chunks_are_consecutive_and_cover_exactly() {
+        let range = 388_368_000..388_800_000; // epoch 899
+        let chunks = generate_chunks(&range, 128);
+        assert_eq!(chunks.first().unwrap().start, range.start);
+        assert_eq!(chunks.last().unwrap().end, range.end);
+        for window in chunks.windows(2) {
+            assert_eq!(window[0].end, window[1].start);
+        }
+        let covered: u64 = chunks.iter().map(|c| c.end - c.start).sum();
+        assert_eq!(covered, range.end - range.start);
+    }
+
+    #[test]
+    fn zero_chunk_size_is_treated_as_one() {
+        let chunks = generate_chunks(&(10..13), 0);
+        assert_eq!(chunks, vec![10..11, 11..12, 12..13]);
+    }
 }
 
 fn human_readable_duration(duration: std::time::Duration) -> String {

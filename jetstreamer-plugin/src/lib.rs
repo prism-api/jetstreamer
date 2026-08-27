@@ -59,6 +59,10 @@
 //! fairly arbitrary order, so you should design your database tables and shared data structures
 //! accordingly.
 //!
+//! Set `JETSTREAMER_ORDERED=1` (see [`PluginRunner::set_ordered`]) to decode consecutive slot
+//! chunks on N workers and receive [`ChunkEvent`] start/complete callbacks so a plugin can emit
+//! frames in global slot order.
+//!
 //! # Examples
 //! ## Defining a Plugin
 //! ```no_run
@@ -141,7 +145,7 @@ use clickhouse::{Client, Row};
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
-    BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
+    BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose_ex,
 };
 use once_cell::sync::Lazy;
 use serde::Serialize;
@@ -150,9 +154,9 @@ use thiserror::Error;
 use tokio::{signal, sync::broadcast};
 use url::Url;
 
-/// Re-exported statistics types produced by [`firehose`].
+/// Re-exported firehose types used by plugins.
 pub use jetstreamer_firehose::firehose::{
-    FirehoseErrorContext, Stats as FirehoseStats, ThreadStats,
+    ChunkEvent, FirehoseErrorContext, Stats as FirehoseStats, ThreadStats,
 };
 
 // Global totals snapshot used to compute overall TPS/ETA between pulses.
@@ -246,6 +250,20 @@ pub trait Plugin: Send + Sync + 'static {
         async move { Ok(()) }.boxed()
     }
 
+    /// Called at the start and end of each ordered-mode slot chunk.
+    ///
+    /// Default is a no-op. Plugins that need monotonic output should buffer on
+    /// [`ChunkEvent::Start`]/[`on_transaction`](Plugin::on_transaction) and emit only after
+    /// consecutive [`ChunkEvent::Complete`] events.
+    fn on_chunk<'a>(
+        &'a self,
+        _thread_id: usize,
+        _db: Option<Arc<Client>>,
+        _chunk: &'a ChunkEvent,
+    ) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+
     /// Invoked once before the firehose starts streaming events.
     fn on_load(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
@@ -267,6 +285,8 @@ pub struct PluginRunner {
     num_threads: usize,
     sequential: bool,
     reverse: bool,
+    ordered: bool,
+    chunk_size: Option<u64>,
     buffer_window_bytes: Option<u64>,
     db_update_interval_slots: u64,
     tui: bool,
@@ -292,6 +312,8 @@ impl PluginRunner {
             num_threads: std::cmp::max(1, num_threads),
             sequential,
             reverse,
+            ordered: false,
+            chunk_size: None,
             buffer_window_bytes,
             db_update_interval_slots: 100,
             tui: false,
@@ -302,6 +324,17 @@ impl PluginRunner {
     /// frontend has data to render.
     pub fn set_tui(&mut self, tui: bool) {
         self.tui = tui;
+    }
+
+    /// Enables ordered-parallel firehose mode (N workers, consecutive chunks, sequenced emit).
+    pub fn set_ordered(&mut self, ordered: bool) {
+        self.ordered = ordered;
+    }
+
+    /// Sets the ordered-mode chunk size in slots. `None` uses
+    /// [`jetstreamer_firehose::firehose::DEFAULT_ORDERED_CHUNK_SIZE`].
+    pub fn set_chunk_size(&mut self, chunk_size: Option<u64>) {
+        self.chunk_size = chunk_size;
     }
 
     /// Registers an additional plugin.
@@ -644,6 +677,47 @@ impl PluginRunner {
             }
         };
 
+        let on_chunk = {
+            let plugin_handles = plugin_handles.clone();
+            let clickhouse = clickhouse.clone();
+            let shutting_down = shutting_down.clone();
+            move |thread_id: usize, chunk: ChunkEvent| {
+                let plugin_handles = plugin_handles.clone();
+                let clickhouse = clickhouse.clone();
+                let shutting_down = shutting_down.clone();
+                async move {
+                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
+                    if plugin_handles.is_empty() {
+                        return Ok(());
+                    }
+                    if shutting_down.load(Ordering::SeqCst) {
+                        log::debug!(
+                            target: &log_target,
+                            "ignoring chunk callback while shutdown is in progress"
+                        );
+                        return Ok(());
+                    }
+                    let chunk = Arc::new(chunk);
+                    for handle in plugin_handles.iter() {
+                        if let Err(err) = handle
+                            .plugin
+                            .on_chunk(thread_id, clickhouse.clone(), chunk.as_ref())
+                            .await
+                        {
+                            log::error!(
+                                target: &log_target,
+                                "plugin {} on_chunk error: {}",
+                                handle.name,
+                                err
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        };
+
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
         let total_slot_count_capture = total_slot_count;
@@ -653,7 +727,11 @@ impl PluginRunner {
         LAST_TOTAL_SLOTS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TXS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TIME_NS.store(monotonic_nanos_since(run_origin), Ordering::Relaxed);
-        metrics::init(if self.sequential { 1 } else { self.num_threads });
+        metrics::init(if self.sequential && !self.ordered {
+            1
+        } else {
+            self.num_threads
+        });
         metrics::set_run_slot_range(slot_range.start, slot_range.end);
         // Stats pulses drive both the log lines and the TUI, so track them whenever either
         // consumer is active.
@@ -799,10 +877,12 @@ impl PluginRunner {
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-        let mut firehose_future = Box::pin(firehose(
+        let mut firehose_future = Box::pin(firehose_ex(
             self.num_threads as u64,
             self.sequential,
             self.reverse,
+            self.ordered,
+            self.chunk_size,
             self.buffer_window_bytes,
             slot_range,
             Some(on_block),
@@ -810,6 +890,7 @@ impl PluginRunner {
             Some(on_entry),
             Some(on_reward),
             Some(on_error),
+            Some(on_chunk),
             stats_tracking,
             Some(shutdown_tx.subscribe()),
         ));
